@@ -1,0 +1,27 @@
+@ParkDesk.Api_HostAddress = http://localhost:5096
+
+### Login as the seeded admin
+POST {{ParkDesk.Api_HostAddress}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "admin@parkdesk.local",
+  "password": "Admin123!"
+}
+
+### List parking lots (public)
+GET {{ParkDesk.Api_HostAddress}}/api/lots
+Accept: application/json
+
+### Check in a walk-in vehicle (requires an Admin/Operator bearer token)
+# @name checkin
+POST {{ParkDesk.Api_HostAddress}}/api/lots/{{lotId}}/sessions/checkin
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "plate": "ABC123",
+  "vehicleType": "Car"
+}
+
+###
