@@ -1,205 +1,266 @@
 # ParkDesk API
 
-API REST para la operación de un estacionamiento: entrada y salida de vehículos, reservas de
-espacio por horario, tarifas con periodo de gracia y tope diario, membresías con descuento y
-cobro de recargo por exceso de tiempo. No es un CRUD de ejemplo: el corazón del proyecto es
-garantizar que **nunca se asigne el mismo espacio físico a dos vehículos** cuando llegan
-solicitudes de entrada al mismo tiempo, y que las reservas respeten la capacidad real del
-estacionamiento.
+> Parking lot operations backend: race-free spot assignment, capacity-aware reservations and real-world pricing rules.
 
-## Qué resuelve
+[![CI](https://github.com/edu-tech220/parkdesk-api/actions/workflows/ci.yml/badge.svg)](https://github.com/edu-tech220/parkdesk-api/actions/workflows/ci.yml)
+![.NET 8](https://img.shields.io/badge/.NET-8.0-512BD4?style=flat-square&logo=dotnet&logoColor=white)
+![ASP.NET Core](https://img.shields.io/badge/ASP.NET%20Core-Web%20API-512BD4?style=flat-square&logo=dotnet&logoColor=white)
+![EF Core](https://img.shields.io/badge/EF%20Core-8.0-6DB33F?style=flat-square)
+![SQL Server](https://img.shields.io/badge/SQL%20Server-2022-CC2927?style=flat-square&logo=microsoftsqlserver&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker&logoColor=white)
 
-Un estacionamiento necesita tres cosas que un CRUD simple no te da:
+## 📌 Overview
 
-1. **Asignación segura de espacios bajo concurrencia.** Cuando dos operadores registran una
-   entrada casi al mismo tiempo y solo queda un espacio libre, el sistema debe garantizar que
-   solo uno de los dos lo consiga, sin bloquear la base de datos ni perder la otra solicitud
-   (que debe fallar con un error claro, no con una condición de carrera silenciosa).
-2. **Reservas con capacidad real.** Un cliente puede reservar un tipo de espacio (Regular,
-   Compacto, Eléctrico, Discapacitados) para una ventana de tiempo futura. El sistema valida que
-   no se comprometan más reservas que espacios físicos existen para ese tipo, considerando
-   traslapes de horario.
-3. **Tarifas con reglas de negocio reales.** Periodo de gracia sin costo, tarifa por hora
-   redondeada hacia arriba, tope diario, descuento por membresía activa y recargo por exceso de
-   tiempo cuando el checkout ocurre después de la ventana reservada.
+ParkDesk is a REST API for running a parking facility: vehicle check-in and check-out, time-slot
+reservations, tariffs with a grace period and a daily cap, membership discounts and overstay
+fees.
 
-## Arquitectura
+It is not a sample CRUD. The core of the project is guaranteeing that **the same physical spot is
+never assigned to two vehicles** when entry requests arrive at the same time, and that
+reservations never exceed the lot's real capacity.
 
-Solución .NET 8 con dos proyectos:
+A parking operation needs three things a plain CRUD does not give you:
 
+1. **Safe spot assignment under concurrency.** When two operators register an entry almost
+   simultaneously and only one spot is left, exactly one of them gets it — without locking the
+   database and without a silent race condition (the other request fails with a clear error).
+2. **Reservations backed by real capacity.** A customer reserves a spot *type* (Regular, Compact,
+   Electric, Disabled) for a future time window. The system rejects a reservation when the
+   overlapping reservations already use every physical spot of that type.
+3. **Pricing with real business rules.** Free grace period, hourly rate rounded up, daily cap,
+   active-membership discount and an overstay fee when checkout happens after the reserved window.
+
+## ✨ Key features and business rules
+
+- **Concurrent check-in** — each vehicle type maps to compatible spot types in priority order
+  (Car → Regular, Compact; Motorcycle → Compact, Regular; Electric → Electric, Regular). Free spots
+  are claimed one by one with optimistic concurrency.
+- **One active session per plate per lot** — a duplicate plate returns `409 Conflict`.
+- **Overlap-based reservation capacity** — overlapping `Pending`/`CheckedIn` reservations of the
+  same type are counted against the number of spots of that type.
+- **Lazy reservation expiry** — a no-show reservation becomes `Expired` 30 minutes after its start
+  time; drivers cannot check in more than 30 minutes early.
+- **Reservation lifecycle** — `Pending → CheckedIn → Completed`, or `Cancelled` / `Expired`.
+- **Pricing** — grace minutes → hourly rounding → daily cap → membership discount → overstay fee.
+- **Memberships** — three seeded plans (0%, 15%, 30% discount); a user can hold only one active
+  membership, and the best active discount is applied at checkout.
+- **Role-based access** — `Admin`, `Operator`, `Customer` via JWT role claims.
+- **Login rate limiting** and **paginated** listings for sessions and reservations.
+
+## 🏗️ Architecture
+
+A .NET 8 solution with two projects: the API and an xUnit test project.
+
+```mermaid
+flowchart LR
+    Client -->|HTTP + JWT| MW[ExceptionHandlingMiddleware<br/>CORS · RateLimiter · Auth]
+    MW --> C[Controllers<br/>thin: validate, call service, map DTOs]
+    C --> S[Services<br/>ParkingService · ReservationService<br/>PricingService · MembershipService · AuthService]
+    S --> DB[(AppDbContext<br/>EF Core)]
+    DB --> SQL[(SQL Server)]
 ```
-src/ParkDesk.Api/        API ASP.NET Core (controllers + EF Core + JWT)
-tests/ParkDesk.Api.Tests/ Pruebas xUnit (unitarias + integración con WebApplicationFactory)
-```
 
-Dentro de la API:
-
-- **Entities/** — modelo de dominio (`ParkingLot`, `ParkingSpot`, `Tariff`, `ParkingSession`,
+- **Entities/** — domain model (`ParkingLot`, `ParkingSpot`, `Tariff`, `ParkingSession`,
   `Reservation`, `MembershipPlan`, `UserMembership`, `User`).
-- **Data/** — `AppDbContext` (configuración de EF Core) y `DbSeeder` (datos iniciales: admin,
-  operador, planes de membresía y un estacionamiento de ejemplo).
-- **Services/** — la lógica de negocio real vive aquí, no en los controllers:
-  - `ParkingService` — asignación concurrente de espacios, check-in/check-out.
-  - `ReservationService` — capacidad por traslape de horarios, expiración de reservas.
-  - `PricingService` — cálculo puro de tarifas (sin dependencias de EF, 100% testeable).
-  - `AuthService` / `Pbkdf2PasswordHasher` — registro, login y hash de contraseñas.
-  - `MembershipService` — suscripción a planes de membresía.
-- **Controllers/** — delgados: validan el modelo, llaman al servicio correspondiente y mapean a
-  DTOs. Toda excepción de negocio (`NotFoundException`, `ConflictException`,
-  `BusinessRuleException`) se traduce a `ProblemDetails` en `ExceptionHandlingMiddleware`.
-- **Common/** — `PagedResult<T>`, excepciones de dominio y el middleware de errores.
+- **Data/** — `AppDbContext` (EF Core configuration) and `DbSeeder` (admin, operator, membership
+  plans and a sample lot).
+- **Services/** — all business logic lives here, not in the controllers:
+  - `ParkingService` — concurrent spot assignment, check-in/check-out.
+  - `ReservationService` — overlap-based capacity, reservation expiry.
+  - `PricingService` — pure pricing calculation (no EF dependency, fully unit-testable).
+  - `AuthService` / `Pbkdf2PasswordHasher` — registration, login and password hashing.
+  - `MembershipService` — membership subscriptions.
+- **Controllers/** — thin: validate the model, call the service, map to DTOs.
+- **Common/** — `PagedResult<T>`, domain exceptions and the error-handling middleware.
 
-## Decisiones técnicas
+## 🧠 Technical decisions
 
-### Concurrencia: token manual en vez de `rowversion`
+### Concurrency: application-managed token instead of `rowversion`
 
-`ParkingSpot.ConcurrencyStamp` es un `Guid` marcado como `IsConcurrencyToken()` en vez de un
-`rowversion` nativo de SQL Server. Un `rowversion` solo funciona contra SQL Server; como las
-pruebas corren contra SQLite (requisito del proyecto), se necesitaba un mecanismo de
-concurrencia optimista que EF Core traduzca igual en cualquier proveedor. El token se
-regenera manualmente en cada escritura, y EF Core genera un `UPDATE ... WHERE Id = @id AND
-ConcurrencyStamp = @stamp` — si otra transacción ya cambió el valor, la actualización afecta
-cero filas y EF lanza `DbUpdateConcurrencyException`.
+`ParkingSpot.ConcurrencyStamp` is a `Guid` configured with `IsConcurrencyToken()` rather than a
+native SQL Server `rowversion`. `rowversion` only works on SQL Server, and the tests run on
+SQLite, so the project needed optimistic concurrency that EF Core translates identically on any
+provider. The token is regenerated on every write, and EF Core issues
+`UPDATE ... WHERE Id = @id AND ConcurrencyStamp = @stamp` — if another transaction already
+changed the row, zero rows are affected and EF throws `DbUpdateConcurrencyException`.
 
-`ParkingService.AssignSpotAsync` usa esto así: toma la lista de espacios libres de un tipo
-(ordenados por código) e intenta reclamarlos uno por uno. Si pierde la carrera por el primero
-(porque otra solicitud ya lo tomó), no falla: simplemente continúa con el siguiente candidato.
-Solo se devuelve "sin espacios disponibles" cuando de verdad no queda ninguno libre. Esto se
-prueba en `ParkingConcurrencyTests`, que lanza 10 check-ins simultáneos contra un
-estacionamiento con 3 espacios y verifica que exactamente 3 tengan éxito, con espacios
-distintos y sin que el conteo final de ocupados se desfase.
+`ParkingService.AssignSpotAsync` builds on this: it loads the free spots of a type (ordered by
+code) and tries to claim them one at a time. Losing the race for one spot is not a failure — the
+service simply moves on to the next candidate. "No spots available" is returned only when none is
+actually free. `ParkingConcurrencyTests` fires **10 simultaneous check-ins against a lot with 3
+spots** and asserts that exactly 3 succeed, on distinct spots, with a consistent occupied count.
 
-### Reservas: capacidad por traslape, no "un hold por espacio"
+### Reservations: capacity by overlap, not "one hold per spot"
 
-A diferencia de un sistema de boletos con holds temporales sobre un asiento específico, aquí
-una reserva compromete un **tipo** de espacio para una ventana de tiempo, no un espacio físico
-concreto (el espacio físico se asigna hasta el check-in, con el mismo mecanismo de concurrencia
-optimista). Al crear una reserva, se cuentan las reservas `Pending`/`CheckedIn` del mismo tipo
-cuyo horario se traslapa con el solicitado; si ese conteo ya iguala el total de espacios de ese
-tipo, se rechaza con `409 Conflict`. Una reserva vencida (el cliente no llegó dentro de los 30
-minutos de gracia después de la hora de inicio) se marca `Expired` de forma perezosa (al
-leerla o listarla), sin necesidad de un `BackgroundService` sondeando la base de datos.
+Unlike a ticketing system that holds a specific seat, a reservation here commits a spot **type**
+for a time window, not a physical spot. The physical spot is assigned at check-in using the same
+optimistic-concurrency mechanism. When a reservation is created, the service counts the
+`Pending`/`CheckedIn` reservations of the same type whose window overlaps the requested one; if
+that count already equals the number of spots of that type, the request is rejected with
+`409 Conflict`. Stale reservations are marked `Expired` lazily (when read or listed), so no
+`BackgroundService` has to poll the database.
 
-### Tarifas: cálculo puro y testeable
+### Pricing: a pure, testable function
 
-`PricingService.Calculate` no toca la base de datos: recibe una tarifa y fechas, y devuelve el
-monto base, el recargo por exceso y el total. Reglas aplicadas en orden: minutos de gracia
-gratuitos → redondeo hacia arriba a la hora completa → tope diario → descuento por membresía →
-recargo por exceso de tiempo si el checkout ocurre después de la ventana reservada. Al ser una
-función pura, se prueba exhaustivamente sin `WebApplicationFactory` ni base de datos.
+`PricingService.Calculate` never touches the database: it takes a tariff and timestamps and
+returns the base amount, the overstay fee and the total. Rules are applied in order: free grace
+minutes → round up to whole hours → daily cap → membership discount → overstay fee (a percentage
+of the hourly rate per started hour past the reserved end time). Being pure, it is tested
+exhaustively without `WebApplicationFactory` or a database.
 
-### Autenticación y autorización
+### Authentication and authorization
 
-JWT con claims de rol (`Admin`, `Operator`, `Customer`). Las contraseñas se protegen con
-PBKDF2-SHA256 (100,000 iteraciones) en vez de un hash simple. Los roles están repartidos así:
+JWT with role claims (`Admin`, `Operator`, `Customer`). Passwords are hashed with
+PBKDF2-SHA256 (100,000 iterations).
 
-| Acción | Rol |
+| Action | Role |
 |---|---|
-| Administrar estacionamientos, espacios y tarifas | `Admin` |
-| Registrar entradas/salidas y check-in de reservas | `Admin`, `Operator` |
-| Crear/cancelar reservas y suscribirse a una membresía | `Customer` (dueño del recurso) |
-| Consultar estacionamientos, espacios y tarifas | público |
+| Manage lots, spots and tariffs | `Admin` |
+| Register entries/exits and reservation check-ins | `Admin`, `Operator` |
+| Create/cancel reservations and subscribe to a membership | `Customer` (resource owner) |
+| Browse lots, spots and tariffs | public |
 
-### Rate limiting y CORS
+### Rate limiting and CORS
 
-El login (`POST /api/auth/login`) está protegido con un limitador de ventana fija
-(`RateLimiting:Login:PermitLimit`, 5 intentos/minuto por defecto) para dificultar fuerza bruta.
-El límite es configurable para no interferir con las pruebas de integración (que inician sesión
-muchas veces dentro de la misma ejecución); `RateLimitingTests` verifica el comportamiento real
-con un límite bajo inyectado solo para ese test. CORS está abierto por defecto y se restringe
-con `Cors:AllowedOrigins` en producción.
+`POST /api/auth/login` is protected by a fixed-window limiter (`RateLimiting:Login:PermitLimit`,
+5 attempts per minute by default) to slow down brute-force attempts. The limit is read lazily
+from configuration so integration tests, which log in many times, are not affected;
+`RateLimitingTests` checks the real `429` behavior with a low limit injected only for that test.
+CORS is open by default and restricted in production via `Cors:AllowedOrigins`.
 
-### Errores como `ProblemDetails`
+### Errors as `ProblemDetails`
 
-Toda excepción de dominio hereda de `ApiException` y declara su propio código HTTP
+Every domain exception derives from `ApiException` and declares its own HTTP status
 (`NotFoundException` → 404, `ConflictException` → 409, `BusinessRuleException` → 422,
-`UnauthorizedException` → 401). `ExceptionHandlingMiddleware` las traduce a
-`application/problem+json` consistente; cualquier excepción no prevista cae a 500 sin filtrar
-detalles internos al cliente.
+`UnauthorizedException` → 401). `ExceptionHandlingMiddleware` turns them into a consistent
+`application/problem+json` body; any unexpected exception becomes a 500 without leaking internal
+details.
 
-## Cómo correrlo
+## 🧰 Tech stack
 
-### Con Docker (API + SQL Server)
+| Area | Technology |
+|---|---|
+| Language / runtime | C# · .NET 8 |
+| Web | ASP.NET Core Web API (controllers), Swagger / OpenAPI (Swashbuckle) |
+| Data access | Entity Framework Core 8 (code-first migrations) |
+| Database | SQL Server 2022 (SQLite in tests) |
+| Security | JWT Bearer, PBKDF2-SHA256, ASP.NET Core rate limiting |
+| Testing | xUnit, FluentAssertions, `WebApplicationFactory` |
+| DevOps | Docker, Docker Compose, GitHub Actions |
+
+## 🚀 Getting started
+
+### With Docker (API + SQL Server)
 
 ```bash
 docker compose up --build
 ```
 
-La API queda disponible en `http://localhost:8080` (Swagger en `/swagger` solo en
-`Development`). Al iniciar, aplica migraciones de EF Core contra SQL Server y siembra datos de
-ejemplo: un usuario administrador (`admin@parkdesk.local` / `Admin123!`), un operador
-(`operator@parkdesk.local` / `Operator123!`), tres planes de membresía y un estacionamiento
-("Plaza Centro") con espacios y tarifas ya configurados.
+The API listens on `http://localhost:8080` (the compose file runs it in the `Production`
+environment, so Swagger is disabled there). On startup it applies EF Core migrations against SQL
+Server and seeds sample data:
 
-### Local (sin Docker)
+- Admin user: `admin@parkdesk.local` / `Admin123!`
+- Operator user: `operator@parkdesk.local` / `Operator123!`
+- Three membership plans and a sample lot ("Plaza Centro") with spots and tariffs already set up.
 
-Requiere .NET 8 SDK y una instancia de SQL Server accesible (ajustar
-`ConnectionStrings:DefaultConnection` en `appsettings.json` o vía variable de entorno
-`ConnectionStrings__DefaultConnection`).
+> The credentials and signing key in `docker-compose.yml` and `appsettings.json` are development
+> placeholders — change them before any real deployment.
+
+### Locally (without Docker)
+
+Requires the .NET 8 SDK and a reachable SQL Server instance (set
+`ConnectionStrings:DefaultConnection` in `appsettings.json` or the
+`ConnectionStrings__DefaultConnection` environment variable).
 
 ```bash
 dotnet run --project src/ParkDesk.Api
 ```
 
-### Migraciones de EF Core
+With the default `http` launch profile the API runs on `http://localhost:5096`, and Swagger UI is
+available at `http://localhost:5096/swagger` (Development environment).
 
-El repositorio ya incluye la migración inicial (`src/ParkDesk.Api/Migrations`). Para generar una
-nueva tras cambiar el modelo:
+### EF Core migrations
+
+The initial migration is already included (`src/ParkDesk.Api/Migrations`). To add a new one after
+changing the model:
 
 ```bash
 dotnet tool restore
-dotnet tool run dotnet-ef migrations add NombreDeLaMigracion -p src/ParkDesk.Api -o Migrations
+dotnet tool run dotnet-ef migrations add MigrationName -p src/ParkDesk.Api -o Migrations
 ```
 
-## Cómo probarlo
+## 🧪 Running tests
 
 ```bash
 dotnet test
 ```
 
-Las pruebas **no requieren SQL Server ni Docker**: usan SQLite en memoria con caché compartida
-(`Mode=Memory;Cache=Shared`) a través de un `WebApplicationFactory<Program>` personalizado
-(`ParkDeskWebApplicationFactory`). El esquema se crea con `EnsureCreated()` (no se corren las
-migraciones de SQL Server contra SQLite, para evitar tipos de columna incompatibles) y se
-siembra con los mismos datos base que usa producción.
+The suite has **25 tests** and needs **neither SQL Server nor Docker**: it uses in-memory SQLite
+with a shared cache (`Mode=Memory;Cache=Shared`) through a custom `WebApplicationFactory<Program>`
+(`ParkDeskWebApplicationFactory`). The schema is created with `EnsureCreated()` (SQL Server
+migrations are not run against SQLite, to avoid incompatible column types) and seeded with the
+same base data used in production.
 
-Cobertura:
-
-- **Unitarias** (`Unit/PricingServiceTests.cs`) — reglas de tarifas: gracia, redondeo, tope
-  diario, descuento, recargo por exceso.
-- **Concurrencia** (`Integration/ParkingConcurrencyTests.cs`) — 10 check-ins simultáneos contra
-  3 espacios disponibles; verifica que no haya doble asignación.
-- **Flujo de autenticación y autorización** (`Integration/AuthFlowTests.cs`) — registro, login,
-  credenciales inválidas, endpoints protegidos por rol.
-- **Flujo de sesiones** (`Integration/SessionsFlowTests.cs`) — check-in/check-out, placa
-  duplicada, estacionamiento lleno, restricción por rol.
-- **Flujo de reservas** (`Integration/ReservationsFlowTests.cs`) — creación, conflicto de
-  capacidad por traslape, check-in, cancelación, aislamiento entre usuarios.
-- **Paginación** (`Integration/PaginationTests.cs`).
-- **Rate limiting** (`Integration/RateLimitingTests.cs`) — verifica el `429` con un límite bajo
-  inyectado solo en ese test, sin afectar al resto de la suite.
-
-## Endpoints principales
-
-| Método | Ruta | Rol |
+| Area | File | What it covers |
 |---|---|---|
-| POST | `/api/auth/register` | público |
-| POST | `/api/auth/login` | público (rate-limited) |
-| GET | `/api/lots` | público |
+| Unit | `Unit/PricingServiceTests.cs` | Grace period, rounding, daily cap, discount, overstay fee |
+| Concurrency | `Integration/ParkingConcurrencyTests.cs` | 10 simultaneous check-ins vs. 3 free spots — no double assignment |
+| Auth | `Integration/AuthFlowTests.cs` | Register, login, invalid credentials, role-protected endpoints |
+| Sessions | `Integration/SessionsFlowTests.cs` | Check-in/check-out, duplicate plate, full lot, role restrictions |
+| Reservations | `Integration/ReservationsFlowTests.cs` | Creation, overlap capacity conflict, check-in, cancellation, user isolation |
+| Pagination | `Integration/PaginationTests.cs` | Paged listings |
+| Rate limiting | `Integration/RateLimitingTests.cs` | `429` with a low limit injected only for that test |
+
+CI (`.github/workflows/ci.yml`) restores, builds and tests the solution on every push and pull
+request to `main`, uploads the test results, and then builds the Docker image.
+
+## 📡 API endpoints
+
+| Method | Route | Access |
+|---|---|---|
+| POST | `/api/auth/register` | Public |
+| POST | `/api/auth/login` | Public (rate-limited) |
+| GET | `/api/lots` | Public |
+| GET | `/api/lots/{id}` | Public |
 | POST | `/api/lots` | Admin |
+| GET | `/api/lots/{lotId}/spots` | Public |
 | POST | `/api/lots/{lotId}/spots` | Admin |
+| GET | `/api/lots/{lotId}/tariffs` | Public |
 | PUT | `/api/lots/{lotId}/tariffs` | Admin |
 | POST | `/api/lots/{lotId}/sessions/checkin` | Admin, Operator |
 | POST | `/api/sessions/{id}/checkout` | Admin, Operator |
-| GET | `/api/sessions` | Admin, Operator (paginado) |
+| GET | `/api/sessions/{id}` | Admin, Operator |
+| GET | `/api/sessions` | Admin, Operator (paginated) |
 | POST | `/api/reservations` | Customer |
+| GET | `/api/reservations/{id}` | Authenticated (owner, or Admin/Operator) |
+| GET | `/api/reservations` | Authenticated (paginated; customers only see their own) |
 | POST | `/api/reservations/{id}/checkin` | Admin, Operator |
-| POST | `/api/reservations/{id}/cancel` | dueño de la reserva o Admin/Operator |
-| GET | `/api/reservations` | autenticado (paginado; Customer solo ve las suyas) |
-| GET | `/api/memberships/plans` | público |
+| POST | `/api/reservations/{id}/cancel` | Reservation owner, or Admin/Operator |
+| GET | `/api/memberships/plans` | Public |
 | POST | `/api/memberships/subscribe` | Customer |
 
-## Stack
+`src/ParkDesk.Api/ParkDesk.Api.http` contains ready-to-run sample requests.
 
-C# / .NET 8, ASP.NET Core Web API, Entity Framework Core, SQL Server (SQLite en pruebas), JWT +
-PBKDF2, rate limiting, xUnit + WebApplicationFactory, Docker, Docker Compose, GitHub Actions.
+## 📁 Project structure
+
+```
+.
+├── .github/workflows/ci.yml       # Build, test and Docker image build
+├── Dockerfile                     # Multi-stage build, runs as non-root user on port 8080
+├── docker-compose.yml             # API + SQL Server 2022
+├── ParkDesk.slnx
+├── src/ParkDesk.Api/
+│   ├── Common/                    # ApiException hierarchy, error middleware, PagedResult<T>
+│   ├── Controllers/               # Auth, ParkingLots, ParkingSpots, Tariffs, Sessions, Reservations, Memberships
+│   ├── Data/                      # AppDbContext, DbSeeder
+│   ├── Dtos/                      # Request/response contracts per resource
+│   ├── Entities/                  # Domain model and enums
+│   ├── Migrations/                # EF Core migrations
+│   ├── Services/                  # Business logic (parking, reservations, pricing, auth, memberships)
+│   └── Program.cs
+└── tests/ParkDesk.Api.Tests/
+    ├── Infrastructure/            # WebApplicationFactory, auth helpers, test setup
+    ├── Integration/               # End-to-end API flows, concurrency, rate limiting
+    └── Unit/                      # PricingService tests
+```
